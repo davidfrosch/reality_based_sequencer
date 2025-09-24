@@ -88,7 +88,7 @@ async function loadSample(url) {
       xhr.responseType = 'arraybuffer';
       
       xhr.onload = async function() {
-        if (xhr.status === 200 || xhr.status === 0) { // 0 for file:// protocol
+            if (xhr.status === 200 || xhr.status === 0) { // 0 for file:// protocol
           try {
             const buffer = await audioCtx.decodeAudioData(xhr.response);
             resolve(buffer);
@@ -97,7 +97,7 @@ async function loadSample(url) {
             reject(error);
           }
         } else {
-          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}`));
+              reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText} loading ${url}`));
         }
       };
       
@@ -119,7 +119,7 @@ async function loadAllSamples() {
   // If user previously saved a sample mapping, prefer that mapping first
   const saved = loadSampleMapping();
   if(saved && Array.isArray(saved) && saved.length===6){
-    for(let i=0;i<6;i++) sampleFiles[i] = saved[i] || sampleFiles[i];
+    for(let i=0;i<6;i++) sampleFiles[i] = saved[i] ? String(saved[i]).trim() : sampleFiles[i];
     console.log('Loaded sample mapping from localStorage:', sampleFiles);
   }
 
@@ -157,28 +157,70 @@ async function loadAllSamples() {
     // replace sampleFiles entries for discovered ones
     for(const idxStr of Object.keys(discovered)){
       const idx = parseInt(idxStr,10);
-      sampleFiles[idx] = discovered[idx];
+  // sanitize whitespace
+  sampleFiles[idx] = String(discovered[idx]).trim();
     }
     console.log('Discovered samples from directory listing:', discovered);
   } else {
     // If discovery failed, leave sampleFiles as-is (fallback)
   console.log('Directory listing discovery failed; falling back to default sample names if present.');
-  const fallback = ['1_kick.wav','2_semisnare.wav','3_crash.wav','4_snare.wav','5_chh.wav','6_ chh2.wav'];
-  for(let i=0;i<6;i++) if(!sampleFiles[i]) sampleFiles[i]=fallback[i];
+  const fallback = ['1_kick.wav','2_semisnare.wav','3_crash.wav','4_snare.wav','5_chh.wav','6_chh2.wav'];
+  for(let i=0;i<6;i++) if(!sampleFiles[i]) sampleFiles[i]=String(fallback[i]).trim();
+  }
+  // Helper: try encoded then raw URL to handle spaces/special chars on some servers
+  async function tryLoadByName(name){
+    const candidateUrls = [`samples/${encodeURIComponent(name)}`, `samples/${name}`];
+    for(const url of candidateUrls){
+      try{
+        const buf = await loadSample(url);
+        if(buf) return {buffer: buf, url};
+      }catch(e){
+        // continue to next candidate
+      }
+    }
+    throw new Error('All attempts failed for: ' + name);
+  }
+
+  // Build a small set of likely candidate filenames for each slot to improve
+  // compatibility with uploaded filenames on GitHub Pages.
+  function buildCandidatesForIndex(i){
+    const base = sampleFiles[i] ? sampleFiles[i].replace(/\s+/g,'') : '';
+    const variants = new Set();
+    if(base) variants.add(base);
+    // common patterns: number_prefix.wav
+    const prefixes = ['','_','-'];
+    // common suffixes and names to try
+    const names = ['kick','snare','semisnare','crash','chh','chh2','hh','hat'];
+    for(const n of names){
+      variants.add(`${i+1}_${n}.wav`);
+      variants.add(`${i+1}${n}.wav`);
+      variants.add(`${i+1}-${n}.wav`);
+      variants.add(`${i+1} ${n}.wav`);
+    }
+    // also try common filename forms with index prefix and original fallback
+    return Array.from(variants);
   }
 
   // Load samples from sampleFiles array (after possible discovery)
   for (let i = 0; i < sampleFiles.length; i++) {
     const name = sampleFiles[i];
     if(!name) continue;
-    try {
-      const buffer = await loadSample(`samples/${name}`);
-      if (buffer) {
-        sampleBuffers[i] = buffer;
-        console.log(`✓ Loaded sample ${i}: ${name}`);
-      }
-    } catch (error) {
-      console.warn(`✗ Failed to load sample ${i}: ${name}`, error);
+    // build candidate list: start with configured name, then common variants
+    const candidates = [name, ...buildCandidatesForIndex(i)];
+    let loaded=false;
+    for(const cand of candidates){
+      try{
+        const result = await tryLoadByName(String(cand).trim());
+        if(result && result.buffer){
+          sampleBuffers[i] = result.buffer;
+          sampleFiles[i] = String(cand).trim();
+          console.log(`✓ Loaded sample ${i}: ${sampleFiles[i]} (via ${result.url})`);
+          loaded=true; break;
+        }
+      }catch(e){ /* try next candidate */ }
+    }
+    if(!loaded){
+      console.warn(`✗ Failed to load any candidate for sample ${i} (tried ${candidates.length} names)`);
     }
   }
 
