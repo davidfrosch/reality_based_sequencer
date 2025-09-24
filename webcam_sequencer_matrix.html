@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Webcam MIDI Sequencer</title>
+<style>
+html, body { margin:0; padding:0; overflow:hidden; background:#0b0b0b; font-family: "Courier New", Courier, monospace; color:#d8f7d8; }
+canvas { display:block; width:100vw; height:100vh; image-rendering:pixelated; }
+#controls {
+  position:fixed; left:50%; bottom:6px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:4px; align-items:center;
+  background:#060606; border:1px solid #0f0; border-radius:4px;
+  padding:4px 6px 4px 6px; min-height:0; max-height:18vh;
+}
+#controls .top { display:flex; gap:8px; align-items:center; }
+#controls .bottom { display:flex; gap:6px; align-items:center; }
+#controls label { color:#7fff7f; font-weight:700; margin-right:6px; font-size:13px; }
+#controls input[type="number"], #controls select { width:72px; padding:4px 6px; background:#070707; color:#d8f7d8; border:1px solid #0f0; border-radius:3px; font-size:13px; }
+#controls input[type="number"].small { width:38px; }
+#controls input[type="range"] { width:160px; }
+#controls input[type="number"].tiny { width:48px; }
+#controls select.playback { width:180px; }
+#controls input, #controls select { outline: none; }
+#controls input:focus, #controls select:focus { box-shadow: 0 0 6px rgba(0,255,0,0.12); }
+#controls .spacer { width:8px; }
+label { margin-right:5px; }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline style="display:none;"></video>
+<canvas id="matrixCanvas"></canvas>
+
+<div id="controls">
+  <div class="top">
+    BPM: <input type="number" id="tempo" value="175" min="30" max="240">
+    Threshold: <input type="number" id="threshold" min="0" max="255" value="180" class="tiny">
+    Playback: <select id="playbackSelect" style="width:180px;"><option value="samples">Samples</option><option value="midi">MIDI</option></select>
+    MIDI Out: <select id="midiOut"></select>
+    Channel: <input type="number" id="midiChannel" value="1" min="1" max="16" class="tiny">
+  </div>
+  <div class="bottom">
+  <div id="rowNotes" style="display:flex; gap:6px; align-items:center;"><label style="margin-right:6px; font-size:12px;">Midi Note:</label></div>
+  <button id="rescanBtn" title="Force re-scan of samples" style="margin-left:8px; padding:4px 8px; background:#070707; color:#d8f7d8; border:1px solid #0f0; border-radius:3px;">Rescan Samples</button>
+  </div>
+</div>
+
+<script>
+// Musical grid (cells) — keep at original 16x6
+const NUM_COLUMNS = 16;
+const NUM_ROWS = 6;
+// Pixel analysis grid — higher resolution for more precise detection (8x)
+const PIXEL_COLUMNS = NUM_COLUMNS * 8; // 128
+const PIXEL_ROWS = NUM_ROWS * 8;       // 48
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('matrixCanvas');
+const ctx = canvas.getContext('2d');
+
+const pixelCanvas = document.createElement('canvas');
+pixelCanvas.width = PIXEL_COLUMNS;
+pixelCanvas.height = PIXEL_ROWS;
+const pixelCtx = pixelCanvas.getContext('2d', { willReadFrequently: true });
+
+const bgCanvas = document.createElement('canvas');
+// Background canvas sized to pixel analysis resolution
+bgCanvas.width = PIXEL_COLUMNS;
+bgCanvas.height = PIXEL_ROWS;
+const bgCtx = bgCanvas.getContext('2d', { willReadFrequently: true });
+
+let midiAccess, midiOutput = null, midiChannel = 1;
+let useWebAudio = false;
+let useSamples = true; // default to samples
+let threshold = 180;
+const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+
+// Sample loading with fallback for file:// protocol
+const sampleBuffers = {};
+// sampleFiles will be populated by discovery; default placeholders kept minimal
+const sampleFiles = [null, null, null, null, null, null];
+
+async function loadSample(url) {
+  try {
+    // Try XMLHttpRequest first for file:// protocol compatibility
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';
+      
+      xhr.onload = async function() {
+        if (xhr.status === 200 || xhr.status === 0) { // 0 for file:// protocol
+          try {
+            const buffer = await audioCtx.decodeAudioData(xhr.response);
+            resolve(buffer);
+          } catch (error) {
+            console.warn(`Failed to decode audio data for: ${url}`, error);
+            reject(error);
+          }
+        } else {
+          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}`));
+        }
+      };
+      
+      xhr.onerror = function() {
+        reject(new Error(`Network error loading: ${url}`));
+      };
+      
+      xhr.send();
+    });
+  } catch (error) {
+    console.warn(`Failed to load sample: ${url}`, error);
+    return null;
+  }
+}
+
+async function loadAllSamples() {
+  console.log('Starting to load samples...');
+
+  // If user previously saved a sample mapping, prefer that mapping first
+  const saved = loadSampleMapping();
+  if(saved && Array.isArray(saved) && saved.length===6){
+    for(let i=0;i<6;i++) sampleFiles[i] = saved[i] || sampleFiles[i];
+    console.log('Loaded sample mapping from localStorage:', sampleFiles);
+  }
+
+  // Attempt 1: fetch directory listing at samples/ and parse HTML links (works when server exposes directory index)
+  async function discoverFromDirectoryListing(){
+    try{
+      const resp = await fetch('samples/');
+      if(!resp.ok) return null;
+      const ct = resp.headers.get('content-type') || '';
+      if(!ct.includes('text/html')) return null;
+      const html = await resp.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const links = Array.from(doc.querySelectorAll('a'))
+        .map(a => a.getAttribute('href'))
+        .filter(Boolean);
+      const found = {};
+      const re = /^\s*([1-6])[^/\\]*\.(wav|mp3|ogg|m4a)\s*$/i;
+      for(const href of links){
+        // normalize href to filename
+        const parts = href.split('/');
+        const name = parts[parts.length-1];
+        const m = name.match(re);
+        if(m){
+          const idx = parseInt(m[1],10)-1;
+          if(idx>=0 && idx<6) found[idx] = name;
+        }
+      }
+      return Object.keys(found).length ? found : null;
+    }catch(e){ return null; }
+  }
+
+  // Attempt discovery
+  const discovered = await discoverFromDirectoryListing();
+  if(discovered){
+    // replace sampleFiles entries for discovered ones
+    for(const idxStr of Object.keys(discovered)){
+      const idx = parseInt(idxStr,10);
+      sampleFiles[idx] = discovered[idx];
+    }
+    console.log('Discovered samples from directory listing:', discovered);
+  } else {
+    // If discovery failed, leave sampleFiles as-is (fallback)
+  console.log('Directory listing discovery failed; falling back to default sample names if present.');
+  const fallback = ['1_kick.wav','2_semisnare.wav','3_crash.wav','4_snare.wav','5_chh.wav','6_ chh2.wav'];
+  for(let i=0;i<6;i++) if(!sampleFiles[i]) sampleFiles[i]=fallback[i];
+  }
+
+  // Load samples from sampleFiles array (after possible discovery)
+  for (let i = 0; i < sampleFiles.length; i++) {
+    const name = sampleFiles[i];
+    if(!name) continue;
+    try {
+      const buffer = await loadSample(`samples/${name}`);
+      if (buffer) {
+        sampleBuffers[i] = buffer;
+        console.log(`✓ Loaded sample ${i}: ${name}`);
+      }
+    } catch (error) {
+      console.warn(`✗ Failed to load sample ${i}: ${name}`, error);
+    }
+  }
+
+  console.log(`Finished loading. Total samples loaded: ${Object.keys(sampleBuffers).length}`);
+
+  if (Object.keys(sampleBuffers).length === 0) {
+    console.warn('⚠️ No samples were loaded. Make sure:');
+    console.warn('1. Sample files exist in the samples/ folder');
+    console.warn('2. You\'re running this from a web server (not file://)');
+    console.warn('3. Or try opening this file via "Open with Live Server" in VS Code');
+  }
+  // Refresh sample name spans in UI
+  updateSampleSpans();
+
+  // Persist the discovered/selected mapping so user choices survive reloads
+  try{ saveSampleMapping(); }catch(e){/* ignore */}
+}
+
+// Persist sample file name mapping in localStorage (only filenames)
+function saveSampleMapping(){
+  try{
+    localStorage.setItem('webcam_seq_sampleFiles', JSON.stringify(sampleFiles));
+    console.log('Saved sample mapping to localStorage');
+  }catch(e){ console.warn('Failed to save sample mapping', e); }
+}
+
+function loadSampleMapping(){
+  try{
+    const raw = localStorage.getItem('webcam_seq_sampleFiles');
+    if(!raw) return null;
+    return JSON.parse(raw);
+  }catch(e){ return null; }
+}
+
+function updateSampleSpans(){
+  const wrappers = rowNotesDiv.querySelectorAll(':scope > div');
+  for(let i=0;i<wrappers.length;i++){
+    const span = wrappers[i].querySelector('span');
+    if(span) span.textContent = sampleFiles[i] || 'empty';
+  }
+}
+
+const defaultNotes=[48,50,52,53,55,57];
+const rowNotesInputs = [];
+const rowMuteInputs = [];
+const rowNotesDiv = document.getElementById('rowNotes');
+for(let i=0;i<NUM_ROWS;i++){
+  // Container for each row's controls: MIDI input and sample name span
+  const wrapper = document.createElement('div');
+  wrapper.style.display='flex'; wrapper.style.alignItems='center'; wrapper.style.gap='4px';
+
+  const input = document.createElement('input');
+  input.type='number'; input.value=defaultNotes[i]; input.min=0; input.max=127; input.className='small';
+  rowNotesInputs.push(input);
+
+  const sampleSpan = document.createElement('span');
+  sampleSpan.textContent = sampleFiles[i] || 'empty';
+  sampleSpan.style.padding = '4px 6px';
+  sampleSpan.style.background = '#050505';
+  sampleSpan.style.border = '1px solid #222';
+  sampleSpan.style.borderRadius = '3px';
+  sampleSpan.style.fontSize = '12px';
+  sampleSpan.style.minWidth = '80px';
+  sampleSpan.style.textAlign = 'center';
+  sampleSpan.style.cursor = 'pointer';
+  sampleSpan.dataset.row = i;
+
+  // Drag & drop handlers for replacing samples
+  sampleSpan.addEventListener('dragover', (e)=>{ e.preventDefault(); sampleSpan.style.background = '#0b200b'; });
+  sampleSpan.addEventListener('dragleave', (e)=>{ e.preventDefault(); sampleSpan.style.background = '#050505'; });
+  sampleSpan.addEventListener('drop', async (e)=>{
+    e.preventDefault(); sampleSpan.style.background = '#050505';
+    const files = e.dataTransfer.files;
+    if(!files || files.length===0) return;
+    const file = files[0];
+    if(!file.type.startsWith('audio/')){
+      console.warn('Dropped file is not audio');
+      return;
+    }
+    await replaceSampleFromFile(i, file, sampleSpan);
+  });
+
+  // Assemble
+  wrapper.appendChild(input);
+  wrapper.appendChild(sampleSpan);
+  rowNotesDiv.appendChild(wrapper);
+
+  // keep arrays aligned
+  const mute = document.createElement('input'); mute.type='checkbox'; mute.title='Mute row'; mute.style.display='none';
+  rowMuteInputs.push(mute);
+}
+
+// Update UI depending on playback mode
+function updateRowNotesUI(){
+  const showingSamples = useSamples || document.getElementById('playbackSelect').value === 'samples';
+  // select only wrapper divs (skip the label node)
+  const wrappers = rowNotesDiv.querySelectorAll(':scope > div');
+  // update label
+  const label = rowNotesDiv.querySelector('label');
+  if(label) label.textContent = showingSamples ? 'Sample Files:' : 'Midi Note:';
+  for(let i=0;i<wrappers.length;i++){
+    const wrapper = wrappers[i];
+    const input = wrapper.querySelector('input[type="number"]');
+    const span = wrapper.querySelector('span');
+    if(!input || !span) continue; // defensive
+    if(showingSamples){ input.style.display='none'; span.style.display='inline-block'; }
+    else { input.style.display='inline-block'; span.style.display='none'; }
+  }
+}
+
+// Replace sample buffer from dropped file
+async function replaceSampleFromFile(rowIndex, file, sampleSpan){
+  try{
+    const arrayBuffer = await file.arrayBuffer();
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+    sampleBuffers[rowIndex] = decoded;
+    sampleFiles[rowIndex] = file.name;
+    sampleSpan.textContent = file.name;
+    console.log('Replaced sample for row', rowIndex, file.name);
+  // Save mapping after user replaces a sample
+  try{ saveSampleMapping(); }catch(e){/* ignore */}
+  }catch(err){ console.error('Failed to load dropped sample', err); }
+}
+
+// Persistent notes matrix (toggled by double-click). These always trigger until removed.
+const persistentMatrix = [];
+for(let y=0;y<NUM_ROWS;y++){
+  const row = [];
+  for(let x=0;x<NUM_COLUMNS;x++) row.push(false);
+  persistentMatrix.push(row);
+}
+
+navigator.requestMIDIAccess().then(ma=>{
+  midiAccess = ma;
+  updateMIDIDevices();
+});
+
+// Initialize samples
+loadAllSamples();
+
+// Rescan button clears saved mapping and attempts discovery again
+document.getElementById('rescanBtn').addEventListener('click', async ()=>{
+  try{ localStorage.removeItem('webcam_seq_sampleFiles'); }catch(e){}
+  // clear current buffers and names
+  for(let i=0;i<6;i++){ sampleBuffers[i]=null; sampleFiles[i]=null; }
+  updateSampleSpans();
+  await loadAllSamples();
+});
+
+function updateMIDIDevices(){
+  const midiOutSelect=document.getElementById('midiOut');
+  midiOutSelect.innerHTML='';
+  for(const output of midiAccess.outputs.values()){
+    const opt = document.createElement('option');
+    opt.value = output.id; opt.textContent = output.name;
+    midiOutSelect.appendChild(opt);
+  }
+  if(midiAccess.outputs.size>0){
+    midiOutput = Array.from(midiAccess.outputs.values())[0];
+  } else {
+    useWebAudio=true;
+  }
+}
+
+document.getElementById('midiOut').addEventListener('change', e=>{ midiOutput = midiAccess.outputs.get(e.target.value); });
+document.getElementById('midiChannel').addEventListener('input', e=>{ midiChannel = Math.min(16, Math.max(1,parseInt(e.target.value))); });
+// Playback select
+document.getElementById('playbackSelect').addEventListener('change', e=>{ useSamples = e.target.value === 'samples'; });
+// reflect changes in row note UI
+document.getElementById('playbackSelect').addEventListener('change', updateRowNotesUI);
+// initialize UI state
+updateRowNotesUI();
+
+function playNoteWebAudio(note){
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type='sine';
+  osc.frequency.value = 440*Math.pow(2,(note-69)/12);
+  gain.gain.setValueAtTime(0, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(0.2, audioCtx.currentTime+0.01);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime+0.3);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime+0.35);
+}
+
+function playSample(rowIndex) {
+  const buffer = sampleBuffers[rowIndex];
+  if (!buffer) {
+    console.warn(`No sample loaded for row ${rowIndex}`);
+    return;
+  }
+  
+  const source = audioCtx.createBufferSource();
+  const gainNode = audioCtx.createGain();
+  source.buffer = buffer;
+  source.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+  gainNode.gain.value = 0.7;
+  source.start();
+}
+
+navigator.mediaDevices.getUserMedia({
+  video: {
+  width: { ideal: 1920 },
+  height: { ideal: 1080 },
+    frameRate: { ideal: 30 },
+    facingMode: 'user'
+  }
+})
+.then(stream=>video.srcObject=stream)
+.catch(console.error);
+
+let tempo = 120;
+document.getElementById('tempo').addEventListener('input', e=>tempo=parseInt(e.target.value));
+document.getElementById('threshold').addEventListener('input', e=>threshold = parseInt(e.target.value));
+
+function getPixelMatrix(){
+  // Draw video into high-res pixel canvas (mirrored horizontally)
+  pixelCtx.save();
+  pixelCtx.translate(PIXEL_COLUMNS, 0);
+  pixelCtx.scale(-1, 1);
+  pixelCtx.drawImage(video, 0, 0, PIXEL_COLUMNS, PIXEL_ROWS);
+  pixelCtx.restore();
+  const frame = pixelCtx.getImageData(0,0,PIXEL_COLUMNS,PIXEL_ROWS).data;
+  const matrix = [];
+  // Determine block size in pixel grid that maps to one musical cell
+  const blockW = Math.floor(PIXEL_COLUMNS / NUM_COLUMNS);
+  const blockH = Math.floor(PIXEL_ROWS / NUM_ROWS);
+  for(let ry=0; ry<NUM_ROWS; ry++){
+    const row = [];
+    for(let rx=0; rx<NUM_COLUMNS; rx++){
+      let sum = 0;
+      let count = 0;
+      const startX = rx * blockW;
+      const startY = ry * blockH;
+      for(let py = startY; py < startY + blockH; py++){
+        for(let px = startX; px < startX + blockW; px++){
+          const i = (py * PIXEL_COLUMNS + px) * 4;
+          const r = frame[i], g = frame[i+1], b = frame[i+2];
+          const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          sum += lum; count++;
+        }
+      }
+      row.push(count ? sum / count : 0);
+    }
+    matrix.push(row);
+  }
+  return matrix;
+}
+
+function thresholdMatrix(matrix){
+  return matrix.map(row => row.map(v => v > threshold ? 1 : 0));
+}
+
+let playColumn = 0;
+let currentMatrix = [];
+let activeRowsOnStep = [];
+let flashState = 0;
+
+function triggerColumn(matrix,column){
+  const triggered = [];
+  for(let y=0;y<NUM_ROWS;y++){
+  // Trigger if live detection OR persistent note is set
+  const live = matrix[y][column];
+  const persistent = persistentMatrix[y][column];
+  if((live || persistent) && !rowMuteInputs[y].checked){
+      if(useSamples) {
+        playSample(y);
+      } else {
+        const note = parseInt(rowNotesInputs[y].value);
+        if(midiOutput){
+          const status = 0x90 | ((midiChannel-1)&0xf);
+          midiOutput.send([status, note, 127]);
+          setTimeout(()=>midiOutput.send([0x80 | ((midiChannel-1)&0xf), note, 0]), 300);
+        } else {
+          playNoteWebAudio(note);
+        }
+      }
+      triggered.push(y);
+    }
+  }
+  return triggered;
+}
+
+function resizeCanvas(){ canvas.width=window.innerWidth; canvas.height=window.innerHeight; }
+window.addEventListener('resize',resizeCanvas);
+resizeCanvas();
+
+// Double-click to toggle persistent notes in the grid
+canvas.addEventListener('dblclick', (ev)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  const cellWidth = Math.floor(canvas.width / NUM_COLUMNS);
+  const cellHeight = Math.floor(canvas.height / NUM_ROWS);
+  const totalGridWidth = cellWidth * NUM_COLUMNS;
+  const totalGridHeight = cellHeight * NUM_ROWS;
+  const offsetX = Math.floor((canvas.width - totalGridWidth) / 2);
+  const offsetY = Math.floor((canvas.height - totalGridHeight) / 2);
+  const gx = Math.floor((x - offsetX) / cellWidth);
+  const gy = Math.floor((y - offsetY) / cellHeight);
+  if(gx>=0 && gx<NUM_COLUMNS && gy>=0 && gy<NUM_ROWS){
+    persistentMatrix[gy][gx] = !persistentMatrix[gy][gx];
+  }
+});
+
+function drawLoop(){
+  requestAnimationFrame(drawLoop);
+  flashState = (flashState + 1) % 20;
+
+  // Background (mirrored horizontally)
+  bgCtx.save();
+  bgCtx.translate(bgCanvas.width, 0);
+  bgCtx.scale(-1, 1);
+  bgCtx.drawImage(video, 0, 0, bgCanvas.width, bgCanvas.height);
+  bgCtx.restore();
+  const frame = bgCtx.getImageData(0,0,bgCanvas.width,bgCanvas.height);
+  // Subtle contrast/brightness adjustment; avoid harsh color forcing
+  const contrast = 1.8; // stronger contrast
+  const brightness = 18; // slightly higher brightness
+  for(let i=0;i<frame.data.length;i+=4){
+    const r = frame.data[i];
+    const g = frame.data[i+1];
+    const b = frame.data[i+2];
+    // compute luminance (Rec. 709)
+    const lum = Math.min(255, Math.max(0, (0.2126*r + 0.7152*g + 0.0722*b) * contrast + brightness));
+    // map luminance into green channel for black/green look
+    frame.data[i]   = 0;
+    frame.data[i+1] = lum;
+    frame.data[i+2] = 0;
+    // keep alpha as-is
+  }
+  bgCtx.putImageData(frame,0,0);
+  ctx.drawImage(bgCanvas,0,0,canvas.width,canvas.height);
+
+  // Disable image smoothing to avoid soft edges
+  ctx.imageSmoothingEnabled = false;
+
+  // Current full matrix for visualization
+  const rawMatrix = getPixelMatrix();
+  currentMatrix = thresholdMatrix(rawMatrix);
+
+  // Compute integer-aligned cell sizes to avoid subpixel gaps
+  const cellWidth = Math.floor(canvas.width / NUM_COLUMNS);
+  const cellHeight = Math.floor(canvas.height / NUM_ROWS);
+  const totalGridWidth = cellWidth * NUM_COLUMNS;
+  const totalGridHeight = cellHeight * NUM_ROWS;
+  const offsetX = Math.floor((canvas.width - totalGridWidth) / 2);
+  const offsetY = Math.floor((canvas.height - totalGridHeight) / 2);
+
+  // Draw persistent notes first (solid bright red)
+  for(let y=0;y<NUM_ROWS;y++){
+    if(rowMuteInputs[y].checked) continue;
+    for(let x=0;x<NUM_COLUMNS;x++){
+      if(persistentMatrix[y][x]){
+        ctx.fillStyle = 'rgb(220,20,20)'; // solid bright red
+        const px = offsetX + x * cellWidth;
+        const py = offsetY + y * cellHeight;
+        ctx.fillRect(px, py, cellWidth + 1, cellHeight + 1);
+      }
+    }
+  }
+
+  // Draw live-triggered notes (solid white)
+  for(let y=0;y<NUM_ROWS;y++){
+    if(rowMuteInputs[y].checked) continue;
+    for(let x=0;x<NUM_COLUMNS;x++){
+      if(currentMatrix[y][x] && !persistentMatrix[y][x]){
+        ctx.fillStyle = 'rgb(255,255,255)';
+        const px = offsetX + x * cellWidth;
+        const py = offsetY + y * cellHeight;
+        ctx.fillRect(px, py, cellWidth + 1, cellHeight + 1);
+      }
+    }
+  }
+
+  // Playhead overlay — use integer alignment and slightly opaque color
+  ctx.fillStyle='rgba(0,200,0,0.18)';
+  const playX = offsetX + playColumn * cellWidth;
+  ctx.fillRect(playX, offsetY, cellWidth + 1, totalGridHeight);
+}
+
+function stepSequencer(){
+  activeRowsOnStep = triggerColumn(currentMatrix, playColumn);
+  playColumn = (playColumn + 1) % NUM_COLUMNS;
+  const interval = (60 / tempo / 4) * 1000; // 1/16 note
+  setTimeout(stepSequencer, interval);
+}
+
+drawLoop();
+stepSequencer();
+</script>
+
+<!-- Help button and modal -->
+<style>
+  #helpBtn { position: fixed; right: 12px; bottom: 12px; width:40px; height:40px; border-radius:20px; background:#071; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; border:2px solid #0f0; cursor:pointer; z-index:9999; box-shadow:0 2px 6px rgba(0,0,0,0.6);} 
+  #helpModalOverlay { position:fixed; inset:0; background:rgba(0,0,0,0.6); display:none; align-items:center; justify-content:center; z-index:10000; }
+  #helpModal { width:min(720px,92vw); max-height:86vh; overflow:auto; background:#060606; border:1px solid #0f0; padding:18px; border-radius:8px; color:#d8f7d8; font-family: monospace; }
+  #helpModal h2 { margin:0 0 8px 0; color:#7fff7f; }
+  #helpModal p{ margin:6px 0; line-height:1.35; }
+  #helpModal .close { position:absolute; right:18px; top:14px; cursor:pointer; color:#7fff7f; }
+  #helpModal pre { background:#020202; padding:8px; border-radius:4px; overflow:auto; }
+</style>
+
+<div id="helpBtn" title="How this page works">?</div>
+<div id="helpModalOverlay" role="dialog" aria-modal="true">
+  <div id="helpModal">
+    <div style="position:relative;">
+      <div class="close" id="helpClose">✕</div>
+      <h2>Reality-based sequencer by david frisch</h2>
+    </div>
+    <p>This page turns your webcam into a live trigger matrix. It analyses the video, detects bright motion, and maps it to a 16×6 sequencer grid.</p>
+    <p>Quick overview:</p>
+    <ul>
+      <li><strong>Playback:</strong> switch between <em>Samples</em> (default) and <em>MIDI</em>. In Samples mode, each row is assigned a sample file from the <code>samples/</code> folder; MIDI mode sends note-on messages to the chosen MIDI output.</li>
+      <li><strong>Sample discovery:</strong> the app attempts to auto-discover files in <code>samples/</code> named starting with 1..6 (for example <code>1_kick.wav</code>). If discovery fails, it falls back to default names. For reliable discovery run the page from a web server (not file://).</li>
+      <li><strong>Replace samples:</strong> drag & drop an audio file onto a row's sample slot to replace that row's sample. Replacements are saved to localStorage so they persist on reload.</li>
+      <li><strong>Rescan Samples:</strong> use the "Rescan Samples" button to clear saved mappings and re-run discovery/loading.</li>
+      <li><strong>Persistent notes:</strong> double-click any grid cell to toggle a persistent (red) note; these will trigger on every step until toggled off.</li>
+      <li><strong>BPM & Threshold:</strong> BPM controls tempo (default 175). Threshold controls how bright a cell must be to trigger; increase to reduce false triggers.</li>
+      <li><strong>MIDI:</strong> select an output and channel. If no MIDI device is available, a WebAudio oscillator is used as a fallback.</li>
+    </ul>
+    
+  </div>
+</div>
+
+<script>
+  const helpBtn = document.getElementById('helpBtn');
+  const helpOverlay = document.getElementById('helpModalOverlay');
+  const helpClose = document.getElementById('helpClose');
+  function openHelp(){ helpOverlay.style.display='flex'; helpClose.focus && helpClose.focus(); }
+  function closeHelp(){ helpOverlay.style.display='none'; }
+  helpBtn.addEventListener('click', openHelp);
+  helpClose.addEventListener('click', closeHelp);
+  helpOverlay.addEventListener('click', e=>{ if(e.target===helpOverlay) closeHelp(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeHelp(); });
+</script>
+</body>
+</html>
